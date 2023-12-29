@@ -12,7 +12,7 @@ import (
 	_ "strings"
 )
 
-func Test_Main(t *testing.T) {
+func Test_Main_test(t *testing.T) {
 	//_, err := InitUser("aaaaaaa", "admin")
 	//if err != nil {
 	//	t.Log(err)

@@ -185,6 +185,9 @@ var _ = Describe("Client Tests", func() {
 			userlib.DebugMsg("Alice storing file %s with content: %s", aliceFile, contentOne)
 			alice.StoreFile(aliceFile, []byte(contentOne))
 
+			name := alice.GetAllFilename()
+			userlib.DebugMsg("Alice's all filename: %s", name)
+
 			userlib.DebugMsg("Alice creating invite for Bob for file %s, and Bob accepting invite under name %s.", aliceFile, bobFile)
 
 			invite, err := alice.CreateInvitation(aliceFile, "bob")
