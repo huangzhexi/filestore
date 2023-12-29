@@ -17,6 +17,8 @@ package client
 import (
 	//"fmt"
 	"errors"
+	"strings"
+	"time"
 
 	"bytes"
 	"encoding/json"
@@ -394,7 +396,15 @@ func GetPKEData(uuid uuid.UUID, owner string, Key userlib.PKEDecKey, v any) erro
 	return nil
 }
 
-// This is the type definition for the User struct.
+type FileInfo struct {
+	Filename       string `json:"filename,omitempty"`
+	Time           string `json:"time,omitempty"`
+	LastModifyTime string `json:"LastModifyTime,omitempty"`
+	Type           string `json:"type,omitempty"`
+	//Size     int    `json:"size,omitempty"`
+}
+
+// User This is the type definition for the User struct.
 // A Go struct is like a Python or Java class - it can have attributes
 // (e.g. like the Username attribute) and methods (e.g. like the StoreFile method below).
 type User struct {
@@ -402,6 +412,8 @@ type User struct {
 	PKEDecKey    userlib.PKEDecKey
 	DSSignKey    userlib.DSSignKey
 	passwordHash []byte
+	//FileNames    []string // to store user filenames, note: it is possibly that files are not accessible to the user.
+	FileInfos []FileInfo
 	//SharedFiles map[string]uuid.UUID
 	// You can add other attributes here if you want! But note that in order for attributes to
 	// be included when this struct is serialized to/from JSON, they must be capitalized.
@@ -432,6 +444,7 @@ func InitUser(username string, password string) (userdataptr *User, err error) {
 	}
 
 	var userdata User
+	userdata.FileInfos = make([]FileInfo, 0) // init
 	userdata.Username = username
 	salt := userlib.RandomBytes(32)
 	saltHash := userlib.Hash([]byte(username + "_salt"))
@@ -744,6 +757,84 @@ var (
 	SharedPrivilege = uint8(2)
 )
 
+func (userdata *User) storeNewFile(filename string, content []byte) (err error) {
+	storageUUID, err := uuid.FromBytes(userlib.Hash([]byte(userdata.Username + "_owned_" + filename))[:16])
+	if err != nil {
+		return err
+	}
+	handler, err := userdata.createNewFile(storageUUID)
+	if err != nil {
+		return err
+	}
+	err = handler.AppendFile(content)
+	if err != nil {
+		return err
+	}
+	//userdata.FileNames = append(userdata.FileNames, filename)
+	lastDot := strings.LastIndex(filename, ".")
+	var ext string
+	if lastDot == -1 {
+		ext = "Unknown"
+	} else {
+		ext = filename[lastDot+1:]
+	}
+	fileinfo := FileInfo{Filename: filename, Time: time.Now().Format("2006-01-02 15:04:05"), LastModifyTime: time.Now().Format("2006-01-02 15:04:05"), Type: ext}
+	userdata.FileInfos = append(userdata.FileInfos, fileinfo)
+
+	return nil
+}
+func (userdata *User) storeRootPrivilegeFile(filename string, content []byte) (err error) {
+	storageUUID, err := uuid.FromBytes(userlib.Hash([]byte(userdata.Username + "_owned_" + filename))[:16])
+	if err != nil {
+		return err
+	}
+	var root RootFile
+	err = GetData(storageUUID, userdata.passwordHash, &root)
+	if err != nil {
+		return err
+	}
+	handler, err := newFileHandler(root.FileID, root.Key)
+	if err != nil {
+		return err
+	}
+	err = handler.OverWrite(content)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+func (userdata *User) storeSharePrivilegeFile(filename string, content []byte) (err error) {
+	sharedUUID, err := uuid.FromBytes(userlib.Hash([]byte(userdata.Username + "_shared_" + filename))[:16])
+	if err != nil {
+		return err
+	}
+	var shared SharedFile
+	err = GetData(sharedUUID, userdata.passwordHash, &shared)
+	if err != nil {
+		return err
+	}
+	var chain signedShareFileChain
+	err = GetPKEData(shared.SignedShareFileChainUUID, shared.Sharer, userdata.PKEDecKey, &chain)
+	if err != nil {
+		return err
+	}
+	var fileInfo DerivedShareFile
+	err = GetData(chain.DerivedShareFileUUID, chain.DerivedShareFileKey, &fileInfo)
+	if err != nil {
+		return err
+	}
+	handler, err := newFileHandler(fileInfo.FileID, fileInfo.Key)
+	if err != nil {
+		return err
+	}
+	err = handler.OverWrite(content)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// CheckFileStatus only check the file status, not guarantee the user has priv to the file.
 func (userdata *User) CheckFileStatus(filename string) (value []byte, statusCode uint8, err error) {
 	storageUUID, err := uuid.FromBytes(userlib.Hash([]byte(userdata.Username + "_owned_" + filename))[:16])
 	if err != nil {
@@ -773,70 +864,81 @@ func (userdata *User) StoreFile(filename string, content []byte) (err error) {
 		return err
 	}
 	if status == FileNotCreated {
-		storageUUID, err := uuid.FromBytes(userlib.Hash([]byte(userdata.Username + "_owned_" + filename))[:16])
-		if err != nil {
-			return err
-		}
-		handler, err := userdata.createNewFile(storageUUID)
-		if err != nil {
-			return err
-		}
-		err = handler.AppendFile(content)
-		if err != nil {
-			return err
-		}
-
+		err = userdata.storeNewFile(filename, content)
 	} else if status == RootPrivilege {
-		storageUUID, err := uuid.FromBytes(userlib.Hash([]byte(userdata.Username + "_owned_" + filename))[:16])
-		if err != nil {
-			return err
+		err = userdata.storeRootPrivilegeFile(filename, content)
+	} else if status == SharedPrivilege {
+		err = userdata.storeSharePrivilegeFile(filename, content)
+	}
+	if err != nil {
+		return err
+	}
+	return nil
+}
+func (userdata *User) DeleteFilename(filename string) (ok bool) {
+	// 删除这个数据。 o(n) 可以optimize。
+	var newFileInfos []FileInfo
+	flag := false
+	for _, info := range userdata.FileInfos {
+		if info.Filename != filename {
+			newFileInfos = append(newFileInfos, info)
+		} else {
+			flag = true
 		}
-		var root RootFile
-		err = GetData(storageUUID, userdata.passwordHash, &root)
-		if err != nil {
-			return err
-		}
-		handler, err := newFileHandler(root.FileID, root.Key)
-		if err != nil {
-			return err
-		}
-		err = handler.OverWrite(content)
-		if err != nil {
-			return err
-		}
+	}
+	userdata.FileInfos = newFileInfos
+	return flag
+}
+
+func (userdata *User) GetAllFilename() []FileInfo {
+	return userdata.FileInfos
+}
+func (userdata *User) checkFileGood(filename string) (bool, error) {
+	_, status, err := userdata.CheckFileStatus(filename)
+	if err != nil {
+		return false, err
+	}
+
+	if status == FileNotCreated {
+		return false, nil
 	} else if status == SharedPrivilege {
 		sharedUUID, err := uuid.FromBytes(userlib.Hash([]byte(userdata.Username + "_shared_" + filename))[:16])
 		if err != nil {
-			return err
+			return false, err
 		}
 		var shared SharedFile
 		err = GetData(sharedUUID, userdata.passwordHash, &shared)
 		if err != nil {
-			return err
+			return false, err
 		}
 		var chain signedShareFileChain
 		err = GetPKEData(shared.SignedShareFileChainUUID, shared.Sharer, userdata.PKEDecKey, &chain)
 		if err != nil {
-			return err
+			return false, err
 		}
 		var fileInfo DerivedShareFile
 		err = GetData(chain.DerivedShareFileUUID, chain.DerivedShareFileKey, &fileInfo)
-		if err != nil {
-			return err
-		}
-		handler, err := newFileHandler(fileInfo.FileID, fileInfo.Key)
-		if err != nil {
-			return err
-		}
-		err = handler.OverWrite(content)
-		if err != nil {
-			return err
+		if bytes.Equal(fileInfo.Key, []byte("")) {
+			//userdata.DeleteFilename(filename)
+			return false, nil
 		}
 	}
-
-	return nil
+	return true, nil
 }
 
+// GetAllGoodFilename 监测所有文件状态，时间复杂度高。
+func (userdata *User) GetAllGoodFilename() []FileInfo {
+	var newFileInfos []FileInfo
+
+	for _, info := range userdata.FileInfos {
+		ok, _ := userdata.checkFileGood(info.Filename)
+		if ok {
+			newFileInfos = append(newFileInfos, info)
+		}
+	}
+	userdata.FileInfos = newFileInfos
+	return userdata.FileInfos
+}
 func (userdata *User) AppendToFile(filename string, content []byte) error {
 	_, status, err := userdata.CheckFileStatus(filename)
 	if err != nil {
@@ -940,6 +1042,7 @@ func (userdata *User) LoadFile(filename string) (content []byte, err error) {
 		var fileInfo DerivedShareFile
 		err = GetData(chain.DerivedShareFileUUID, chain.DerivedShareFileKey, &fileInfo)
 		if bytes.Equal(fileInfo.Key, []byte("")) {
+			//userdata.DeleteFilename(filename)
 			return nil, ErrPermissionDenied
 		}
 		//userlib.DebugMsg(chain.DerivedShareFileUUID.String())
@@ -1084,6 +1187,18 @@ func (userdata *User) AcceptInvitation(senderUsername string, invitationPtr uuid
 	if err != nil {
 		return err
 	}
+
+	lastDot := strings.LastIndex(filename, ".")
+	var ext string
+	if lastDot == -1 {
+		ext = "Unknown"
+	} else {
+		ext = filename[lastDot+1:]
+	}
+	fileinfo := FileInfo{Filename: filename, Time: time.Now().Format("2006-01-02 15:04:05"), LastModifyTime: time.Now().Format("2006-01-02 15:04:05"), Type: ext}
+
+	//userdata.FileNames = append(userdata.FileNames, filename)
+	userdata.FileInfos = append(userdata.FileInfos, fileinfo)
 
 	return nil
 }
